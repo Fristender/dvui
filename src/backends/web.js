@@ -144,6 +144,169 @@ export function dvui(canvas, wasmRef) {
     });
 }
 
+/**
+ * Manages a hidden input element for IME / on-screen keyboard support.
+ */
+class HiddenInputManager {
+    /** @type {HTMLInputElement} */
+    hiddenInput;
+    /**
+     * x y w h of on screen keyboard editing position, or empty if none
+     *
+     * @type {[number, number, number, number] | []} */
+    textInputRect = [];
+    /** @type {HTMLElement} */
+    target;
+
+    /**
+     * @param {HTMLElement} target - Element to position relative to (typically canvas)
+     */
+    constructor(target) {
+        this.target = target;
+        this.hiddenInput = document.createElement("input");
+        this.hiddenInput.setAttribute("autocapitalize", "none");
+        this.hiddenInput.style.position = "absolute";
+        this.hiddenInput.style.left = "0";
+        this.hiddenInput.style.top = "0";
+        // remove extra size so input doesn't cause overflow
+        this.hiddenInput.style.padding = "0";
+        this.hiddenInput.style.border = "0";
+        this.hiddenInput.style.margin = "0";
+        this.hiddenInput.style.opacity = "0";
+        this.hiddenInput.style.zIndex = "-1";
+        document.body.prepend(this.hiddenInput);
+    }
+
+    /**
+     * Set the on screen keyboard editing position, or empty if none.
+     * @param {[number, number, number, number] | []} rect - x y w h
+     */
+    setRect(rect) {
+        if (rect.length === 4 && rect[2] > 0 && rect[3] > 0) {
+            this.textInputRect = rect;
+        } else {
+            this.textInputRect = [];
+        }
+    }
+
+    // This does 2 things:
+    // * on desktop it's needed for us to get text events (not just char down/up)
+    // * on touch it's needed to show the on screen keyboard
+    oskCheck() {
+        if (this.textInputRect.length === 0) {
+            this.target.focus();
+        } else {
+            const rect = this.target.getBoundingClientRect();
+            const left = window.scrollX + rect.left + this.textInputRect[0];
+            const top = window.scrollY + rect.top + this.textInputRect[1];
+            // limit the width and height to prevent overflow
+            const width = Math.max(
+                0,
+                Math.min(
+                    this.textInputRect[2],
+                    this.target.clientWidth - this.textInputRect[0]
+                )
+            );
+            const height = Math.max(
+                0,
+                Math.min(
+                    this.textInputRect[3],
+                    this.target.clientHeight - this.textInputRect[1]
+                )
+            );
+            this.hiddenInput.style.left = left + "px";
+            this.hiddenInput.style.top = top + "px";
+            this.hiddenInput.style.width = width + "px";
+            this.hiddenInput.style.height = height + "px";
+            this.hiddenInput.focus();
+            //par.textContent = hiddenInput.style.left + " " + hiddenInput.style.top + " " + hiddenInput.style.width + " " + hiddenInput.style.height;
+        }
+    }
+}
+
+/**
+ * Tracks wheel/touchpad scroll deltas and produces normalized tick values.
+ */
+class WheelHandler {
+    /** The lowest deltaX/Y seen, used to determine the delta for touchpads
+     *
+     * The first number is x and second is y
+     * @type {[number, number]} */
+    scrollLowest = [99999, 99999];
+    /** The lowest deltaX/Y seen in this batch (resets if none in 1s).  Used to
+     * determine if we think a touchpad is being used and also as the delta for
+     * mouse wheels.
+     *
+     * The first number is x and second is y
+     * @type {[number, number]} */
+    scrollLowestBatch = [99999, 99999];
+    scrollLastMs = Date.now();
+    touchpadAdj = 0.025;
+
+    /**
+     * Process a WheelEvent and return scroll actions.
+     * @param {WheelEvent} ev
+     * @returns {{axis: number, ticks: number, trackpad: number}[]}
+     */
+    processWheelEvent(ev) {
+        const actions = [];
+
+        // If we haven't gotten a wheel event in a second, reset our first
+        // because the user might have switched between mouse and touchpad.
+        if ((Date.now() - this.scrollLastMs) > 1000) {
+            this.scrollLowestBatch = [99999, 99999];
+        }
+        this.scrollLastMs = Date.now();
+
+        if (ev.deltaX !== 0) {
+            const result = this._processAxis(0, ev.deltaX, ev.deltaMode);
+            if (result) actions.push({ axis: 0, ...result });
+        }
+        if (ev.deltaY !== 0) {
+            const result = this._processAxis(1, ev.deltaY, ev.deltaMode);
+            if (result) actions.push({ axis: 1, ...result });
+        }
+
+        return actions;
+    }
+
+    _processAxis(index, delta, deltaMode) {
+        const absDelta = Math.abs(delta);
+        this.scrollLowest[index] = Math.min(absDelta, this.scrollLowest[index]);
+        this.scrollLowestBatch[index] = Math.min(absDelta, this.scrollLowestBatch[index]);
+
+        let ticks = -delta;
+        let trackpad = 0;
+
+        if (deltaMode !== 0) {
+            // only mouse wheels produce non-pixel deltas, so this is definitive without
+            // needing the magnitude heuristic.
+            ticks /= this.scrollLowestBatch[index];
+        } else if (
+            this.scrollLowestBatch[index] >= 100 || // most wheels
+            this.scrollLowestBatch[index] === 16 || // mac firefox
+            (index === 0 && (
+                this.scrollLowestBatch[index] === 9 || // mac firefox holding shift
+                this.scrollLowestBatch[index] === 40 // mac safari/chrome holding shift
+            )) ||
+            this.scrollLowestBatch[index] === 4.000244140625 // mac safari/chrome
+        ) {
+            // assume this is a mouse wheel
+            ticks /= this.scrollLowestBatch[index];
+            if (this.scrollLowestBatch[index] === 4.000244140625) {
+                ticks *= this.touchpadAdj; // mac safari/chrome scroll-wheel-like touchpad
+            }
+        } else {
+            // assume touchpad
+            trackpad = 1;
+            ticks = (ticks / this.scrollLowest[index]) * this.touchpadAdj;
+        }
+
+        return { ticks, trackpad };
+    }
+}
+
+
 const utf8decoder = new TextDecoder();
 const utf8encoder = new TextEncoder();
 
@@ -192,30 +355,13 @@ export class Dvui {
     instance;
     stopped = false;
     console_string = "";
-    /** @type {HTMLInputElement} */
-    hidden_input;
+    /** @type {HiddenInputManager | null} */
+    hiddenInputMgr = null;
     /**
      * list of tuple (touch identifier, initial index)
      * @type {[number, number][]} */
     touches = [];
-    /** The lowest deltaX/Y seen, used to determine the delta for touchpads
-     *
-     * The first number is x and second is y
-     * @type {[number, number]} */
-    scroll_lowest = [99999, 99999];
-    /** The lowest deltaX/Y seen in this batch (resets if none in 1s).  Used to
-     * determine if we think a touchpad is being used and also as the delta for
-     * mouse wheels.
-     *
-     * The first number is x and second is y
-     * @type {[number, number]} */
-    scroll_lowest_batch = [99999, 99999];
-    scroll_last_ms = Date.now();
-    /**
-     * x y w h of on screen keyboard editing position, or empty if none
-     *
-     * @type {[number, number, number, number] | []} */
-    textInputRect = [];
+    wheelHandler = new WheelHandler();
 
     // Used for file uploads. Only valid for one frame
     filesCacheModified = false;
@@ -227,40 +373,6 @@ export class Dvui {
 
     get webgl2() {
         return this.gl instanceof WebGL2RenderingContext;
-    }
-
-    // This does 2 things:
-    // * on desktop it's needed for us to get text events (not just char down/up)
-    // * on touch it's needed to show the on screen keyboard
-    oskCheck() {
-        if (this.textInputRect.length == 0) {
-            this.gl.canvas.focus();
-        } else {
-            const rect = this.gl.canvas.getBoundingClientRect();
-            const left = window.scrollX + rect.left + this.textInputRect[0];
-            const top = window.scrollY + rect.top + this.textInputRect[1];
-            // limit the width and height to prevent overflow
-            const width = Math.max(
-                0,
-                Math.min(
-                    this.textInputRect[2],
-                    this.gl.canvas.clientWidth - left,
-                ),
-            );
-            const height = Math.max(
-                0,
-                Math.min(
-                    this.textInputRect[2],
-                    this.gl.canvas.clientHeight - top,
-                ),
-            );
-            this.hidden_input.style.left = left + "px";
-            this.hidden_input.style.top = top + "px";
-            this.hidden_input.style.width = width + "px";
-            this.hidden_input.style.height = height + "px";
-            this.hidden_input.focus();
-            //par.textContent = hidden_input.style.left + " " + hidden_input.style.top + " " + hidden_input.style.width + " " + hidden_input.style.height;
-        }
     }
 
     touchIndex(pointerId) {
@@ -353,19 +465,6 @@ export class Dvui {
     }
 
     constructor() {
-        this.hidden_input = document.createElement("input");
-        this.hidden_input.setAttribute("autocapitalize", "none");
-        this.hidden_input.style.position = "absolute";
-        this.hidden_input.style.left = 0;
-        this.hidden_input.style.top = 0;
-        // remove extra size so input doesn't cause overflow
-        this.hidden_input.style.padding = 0;
-        this.hidden_input.style.border = 0;
-        this.hidden_input.style.margin = 0;
-        this.hidden_input.style.opacity = 0;
-        this.hidden_input.style.zIndex = -1;
-        document.body.prepend(this.hidden_input);
-
         this.imports = {
             wasm_about_webgl2: () => {
                 if (this.webgl2) {
@@ -854,11 +953,7 @@ export class Dvui {
                 this.gl.canvas.style.cursor = cursor_name;
             },
             wasm_text_input: (x, y, w, h) => {
-                if (w > 0 && h > 0) {
-                    this.textInputRect = [x, y, w, h];
-                } else {
-                    this.textInputRect = [];
-                }
+                this.hiddenInputMgr.setRect([x, y, w, h]);
             },
             wasm_open_url: (ptr, len, new_win) => {
                 const url = this.stringFromPointer(ptr, len);
@@ -970,11 +1065,12 @@ export class Dvui {
                 if (navigator.clipboard) {
                     navigator.clipboard.writeText(msg);
                 } else {
-                    this.hidden_input.value = msg;
-                    this.hidden_input.focus();
-                    this.hidden_input.select();
+                    const hiddenInput = this.hiddenInputMgr.hiddenInput;
+                    hiddenInput.value = msg;
+                    hiddenInput.focus();
+                    hiddenInput.select();
                     document.execCommand("copy");
-                    this.hidden_input.value = "";
+                    hiddenInput.value = "";
                 }
             },
             wasm_add_noto_font: () => {
@@ -1139,6 +1235,7 @@ export class Dvui {
             this.gl.canvas.clientWidth,
             this.gl.canvas.clientHeight,
         );
+        this.hiddenInputMgr = new HiddenInputManager(canvas);
     }
 
     init() {
@@ -1237,7 +1334,7 @@ export class Dvui {
 
         // This oskCheck is for desktop to get text events.  Touch devices will
         // show/hide the keyboard (but not all, see touchend handler).
-        this.oskCheck();
+        this.hiddenInputMgr.oskCheck();
 
         if (!this.filesCacheModified) {
             // Only clear if we didn't add anything this frame. Async could add items after they were requested
@@ -1311,90 +1408,12 @@ export class Dvui {
             if (this.stopped) return;
             ev.preventDefault();
 
-            // If we haven't gotten a wheel event in a second, reset our first
-            // because the user might have switched between mouse and touchpad.
-            if ((Date.now() - this.scroll_last_ms) > 1000) {
-                this.scroll_lowest_batch = [99999, 99999];
-            }
-            this.scroll_last_ms = Date.now();
-
-            const touchpad_adj = 0.025;
-
-            if (ev.deltaX != 0) {
-                this.scroll_lowest[0] = Math.min(
-                    Math.abs(ev.deltaX),
-                    this.scroll_lowest[0],
-                );
-                this.scroll_lowest_batch[0] = Math.min(
-                    Math.abs(ev.deltaX),
-                    this.scroll_lowest_batch[0],
-                );
-                var ticks = -ev.deltaX;
-                var trackpad = 0;
-                if (ev.deltaMode !== 0) {
-                    // only mouse wheels produce non-pixel deltas, so this is definitive without
-                    // needing the magnitude heuristic.
-                    ticks /= this.scroll_lowest_batch[0];
-                } else if ((this.scroll_lowest_batch[0] >= 100) || // most wheels
-                    (this.scroll_lowest_batch[0] === 16) || // mac firefox
-                    (this.scroll_lowest_batch[0] === 9) || // mac firefox holding shift
-                    (this.scroll_lowest_batch[0] === 40) || // mac safari/chrome holding shift
-                    (this.scroll_lowest_batch[0] === 4.000244140625)) { // mac safari/chrome
-                    // assume this is a mouse wheel
-                    ticks /= this.scroll_lowest_batch[0];
-                    if (this.scroll_lowest_batch[0] === 4.000244140625) {
-                        ticks *= touchpad_adj; // mac safari/chrome scale wheel like touchpad
-                    }
-                    //console.log("wheelX -deltaX " + -ev.deltaX + " ticks " + ticks);
-                } else {
-                    // assume touchpad
-                    trackpad = 1;
-                    ticks = ticks / this.scroll_lowest[0] * touchpad_adj;
-                    //console.log("touchpadX -deltaX " + -ev.deltaX + " ticks " + ticks);
-                }
+            for (const action of this.wheelHandler.processWheelEvent(ev)) {
                 this.instance.exports.add_event(
                     4,
-                    0,
-                    trackpad,
-                    ticks,
-                    0,
-                );
-            }
-            if (ev.deltaY != 0) {
-                //console.log("deltaMode: " + ev.deltaMode + " deltaY: " + ev.deltaY);
-                this.scroll_lowest[1] = Math.min(
-                    Math.abs(ev.deltaY),
-                    this.scroll_lowest[1],
-                );
-                this.scroll_lowest_batch[1] = Math.min(
-                    Math.abs(ev.deltaY),
-                    this.scroll_lowest_batch[1],
-                );
-                var ticks = -ev.deltaY;
-                var trackpad = 0;
-                if (ev.deltaMode !== 0) {
-                    // only mouse wheels produce non-pixel deltas
-                    ticks /= this.scroll_lowest_batch[1];
-                } else if ((this.scroll_lowest_batch[1] >= 100) || // most wheels
-                    (this.scroll_lowest_batch[1] === 16) || // mac firefox
-                    (this.scroll_lowest_batch[1] === 4.000244140625)) { // mac safari/chrome
-                    // assume this is a mouse wheel
-                    ticks /= this.scroll_lowest_batch[1];
-                    if (this.scroll_lowest_batch[1] === 4.000244140625) {
-                        ticks *= touchpad_adj; // mac safari/chrome scale wheel like touchpad
-                    }
-                    //console.log("wheelY -deltaY " + -ev.deltaY + " ticks " + ticks);
-                } else {
-                    // assume touchpad
-                    trackpad = 1;
-                    ticks = ticks / this.scroll_lowest[1] * touchpad_adj;
-                    //console.log("touchpadY -deltaY " + -ev.deltaY + " ticks " + ticks);
-                }
-                this.instance.exports.add_event(
-                    4,
-                    1,
-                    trackpad,
-                    ticks,
+                    action.axis,
+                    action.trackpad,
+                    action.ticks,
                     0,
                 );
             }
@@ -1430,7 +1449,7 @@ export class Dvui {
             }
         };
         this.gl.canvas.addEventListener("keydown", keydown.bind(this));
-        this.hidden_input.addEventListener("keydown", keydown.bind(this));
+        this.hiddenInputMgr.hiddenInput.addEventListener("keydown", keydown.bind(this));
 
         let keyup = (ev) => {
             if (this.stopped) return;
@@ -1447,9 +1466,9 @@ export class Dvui {
             this.requestRender();
         };
         this.gl.canvas.addEventListener("keyup", keyup.bind(this));
-        this.hidden_input.addEventListener("keyup", keyup.bind(this));
+        this.hiddenInputMgr.hiddenInput.addEventListener("keyup", keyup.bind(this));
 
-        this.hidden_input.addEventListener("beforeinput", (ev) => {
+        this.hiddenInputMgr.hiddenInput.addEventListener("beforeinput", (ev) => {
             if (this.stopped) return;
             ev.preventDefault();
             if (ev.data && !ev.isComposing) {
@@ -1465,7 +1484,7 @@ export class Dvui {
                 this.requestRender();
             }
         });
-        this.hidden_input.addEventListener("compositionend", (ev) => {
+        this.hiddenInputMgr.hiddenInput.addEventListener("compositionend", (ev) => {
             if (this.stopped) return;
             if (ev.data) {
                 const str = utf8encoder.encode(ev.data);
@@ -1526,7 +1545,7 @@ export class Dvui {
             // This oskCheck is for some platforms (iphone) where showing
             // the keyboard has to be done inside an event handler.
             // https://stackoverflow.com/a/6837575
-            this.oskCheck();
+            this.hiddenInputMgr.oskCheck();
             this.requestRender();
         });
         this.gl.canvas.addEventListener("touchmove", (ev) => {
